@@ -1,0 +1,290 @@
+---
+title: "PROD"
+author: "ANSHUMAN SHAJI"
+date: "2025-04-07"
+output:
+  pdf_document:
+    extra_dependencies: booktabs
+    keep_tex: true
+  html_document: default
+  word_document: default
+---
+
+```{r setup, results='asis',include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_knit$set(root.dir = "/Users/anshoe/Documents/Capstone")
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r dataread,results='asis'}
+library(tidyverse)
+library(MatchIt)
+setwd("/Users/anshoe/Documents/Capstone")
+df <- read_csv("df_merged_final.csv")
+df <- df %>%
+  mutate(FY_YEAR = as.numeric(substr(as.character(sa_finance1_year), 1, 4)))
+df['productivity_proxy'] = df['sa_total_income'] / df['sa_compensation_to_employees']
+df <- df %>%
+  filter(!is.na(sa_total_assets))
+df <- df %>%
+  filter(!is.na(productivity_proxy))  
+df <- df %>%
+  group_by(sa_company_name) %>%
+  arrange(FY_YEAR) %>%
+  mutate(
+    Prod_Growth = (productivity_proxy / lag(productivity_proxy,3))^(1/3) - 1
+  ) %>%
+  ungroup()
+df <- df %>%
+  mutate(
+    Prod_Growth = ifelse(is.infinite(Prod_Growth) | is.nan(Prod_Growth), NA, Prod_Growth)
+  )
+df <- df %>%
+  mutate(industry_category = as.numeric(as.factor(co_industry_gp_code_y)))
+df_filtered <- df %>%
+  filter((PE_transaction == 1 & FY_YEAR == TX_YEAR) | (PE_transaction == 0))
+treatment_firms <- df_filtered %>%
+  filter(PE_transaction == 1) %>%
+  distinct(sa_company_name, industry_category, Prod_Growth, TX_YEAR)
+df_filtered <- df_filtered %>%
+  filter(!is.na(Prod_Growth))
+# Perform Nearest Neighbor Matching (
+match_model <- matchit(PE_transaction ~ Prod_Growth + industry_category + FY_YEAR + sa_total_assets,
+                       data = df_filtered,
+                       method = "nearest",
+                       ratio = 1,
+                       exact = ~industry_category + FY_YEAR)  # Ensures match within the same industry and TX_YEAR
+matched_data <- match.data(match_model)
+df_matched <- df %>%
+  semi_join(matched_data, by = "sa_company_name") %>%
+  left_join(matched_data %>% select(sa_company_name, subclass), by = "sa_company_name")  # Ensure subclass is included
+tx_year_map <- df_matched %>%
+  filter(PE_transaction == 1) %>%
+  select(subclass, TX_YEAR) %>%
+  distinct()
+df_matched <- df_matched %>%
+  left_join(tx_year_map, by = "subclass", suffix = c("", "_treat")) %>%
+  mutate(TX_YEAR = ifelse(is.na(TX_YEAR), TX_YEAR_treat, TX_YEAR)) %>%
+  select(-TX_YEAR_treat)
+# cleaning and matching treatment-control ends here
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r outputmodel,results='asis',}
+
+library(dplyr)
+library(fixest)
+
+df_matched <- df_matched %>%
+  filter(sa_ann_rep_months == 12)
+df_matched2 <- df_matched %>%
+  mutate(Post = ifelse(FY_YEAR >= TX_YEAR, 1, 0))
+df_matched2 <- df_matched2[is.finite(df_matched2$productivity_proxy), ]
+
+model= feols(productivity_proxy ~ Post+PE_transaction+ PE_transaction * Post | industry_category + subclass, data = df_matched2)
+etable(
+  model,
+  dict = c(
+    productivity_proxy= "Productivity Proxy (\\$ earned for \\$ spent)",
+    Post = "Post-Buyout Period",
+    PE_transaction = "PE-Acquired Firm",
+    "Post:PE_transaction" = "Treatment Effect (Post × PE)"
+  ),
+  tex = TRUE,
+  title = "Difference-in-Differences (FE) Regression Results: Effect of Private Equity on Productivity",
+  digits = 2
+)
+
+``` 
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r outputPLOTS,results='asis', echo=FALSE,fig.width=16, fig.height=18}
+# Aggregate trends
+df_matched2 <- df_matched2 %>%
+  mutate(
+    Time_Category = case_when(
+      FY_YEAR == TX_YEAR - 2 ~ "T-2",
+      FY_YEAR == TX_YEAR - 1 ~ "T-1",
+      FY_YEAR == TX_YEAR ~ "T0",     
+      FY_YEAR == TX_YEAR + 1 ~ "T+1",
+      FY_YEAR == TX_YEAR + 2 ~ "T+2",
+      TRUE ~ NA_character_  
+    )
+  )
+df_matched2 <- df_matched2 %>%
+  filter(!is.na(Time_Category)) %>%
+  filter(!(subclass %in% c(248, 231, 220, 151, 219, 228))) %>%
+  mutate(Time_Category = factor(Time_Category, levels = c("T-2", "T-1", "T0", "T+1", "T+2")))
+industry_average <- df_matched2 %>%
+  group_by(Time_Category, PE_transaction) %>%
+  summarise(avg_prod = mean(productivity_proxy, na.rm = TRUE), .groups = "drop")
+p <- ggplot(industry_average, aes(
+  x = Time_Category,
+  y = avg_prod,
+  color = as.factor(PE_transaction),
+  group = PE_transaction
+)) +
+  geom_line(size = 1.3) +
+  geom_point(size = 3.5) +
+  scale_color_manual(
+    values = c("0" = "#a29bfe", "1" = "#6c5ce7"),
+    labels = c("0" = "Control", "1" = "Treatment (PE)"),
+    name = "Group"
+  ) +
+  labs(
+    title = "Average Productivity Trends: PE vs Non-PE Firms",
+    subtitle = "Time-Adjusted Comparison Relative to Transaction Year",
+    x = "Years Relative to Buyout",
+    y = "Productivity Ratio($ sales per $ compensation)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.subtitle = element_text(size = 11),
+    legend.position = "bottom",
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10)
+  )
+p
+
+#industry aggregate plota
+df_matched2 <- df_matched2 %>%
+  mutate(
+    Time_Category = case_when(
+      FY_YEAR == TX_YEAR - 2 ~ "T-2",
+      FY_YEAR == TX_YEAR - 1 ~ "T-1",
+      FY_YEAR == TX_YEAR ~ "T0",
+      FY_YEAR == TX_YEAR + 1 ~ "T+1",
+      FY_YEAR == TX_YEAR + 2 ~ "T+2",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Time_Category)) %>%
+  mutate(Time_Category = factor(Time_Category, levels = c("T-2", "T-1", "T0", "T+1", "T+2")))
+industry_avg <- df_matched2 %>%
+  group_by(industry_category, Time_Category, PE_transaction) %>%
+  summarise(avg_prod = mean(productivity_proxy, na.rm = TRUE), .groups = "drop")
+p_industry <- ggplot(industry_avg, aes(
+  x = Time_Category,
+  y = avg_prod,
+  color = as.factor(PE_transaction),
+  group = PE_transaction
+)) +
+  geom_line(size = 1) +
+  geom_point(size = 2.2) +
+  facet_wrap(~ industry_category, scales = "free_y", ncol = 4) +  
+  scale_color_manual(
+    values = c("0" = "#a29bfe", "1" = "#6c5ce7"),
+    labels = c("0" = "Control", "1" = "Treatment (PE)"),
+    name = "Group"
+  ) +
+  labs(
+    title = "Average Total Productivity Trends by Industry",
+    subtitle = "PE vs Non-PE Firms, Relative to Transaction Year",
+    x = "Years Relative to Buyout",
+    y = "Avg Compensation Paid"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 9),
+    panel.grid.major.x = element_blank()
+  )
+print(p_industry)
+
+#delta plots
+library(tidyr)
+outcomes <- c("productivity_proxy")
+df_filtered <- df_matched2 %>%
+  filter(Time_Category %in% c("T-2", "T+2")) %>%
+  mutate(Time_label = ifelse(Time_Category == "T-2", "T_minus_2", "T_plus_2"))
+df_long <- df_filtered %>%
+  select(PE_transaction, Time_label, all_of(outcomes)) %>%
+  pivot_longer(cols = -c(PE_transaction, Time_label),
+               names_to = "variable", values_to = "value")
+summary_df <- df_long %>%
+  group_by(PE_transaction, Time_label, variable) %>%
+  summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Time_label, values_from = mean_val) %>%
+  mutate(diff = T_plus_2 - T_minus_2)
+summary_df <- summary_df %>%
+  mutate(Group = ifelse(PE_transaction == 1, "Treatment", "Control"))
+ggplot(summary_df, aes(x = variable, y = diff, fill = Group)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, color = "white") +
+  scale_fill_manual(values = c("Treatment" = "#6A0DAD", "Control" = "#D3BCE3")) +  # Violet tones
+  labs(
+    title = "Change in Productivity (T+2 - T-2)",
+    x = "",
+    y = "Difference",
+    fill = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.text = element_text(size = 13),
+    axis.title.y = element_text(size = 14),
+    legend.position = "top",
+    legend.text = element_text(size = 12),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+# Random Parallel trends test
+set.seed(120)  # For reproducibility
+random_subclasses <- df_matched2 %>%
+  distinct(subclass) %>%
+  sample_n(4) %>%
+  pull(subclass)
+plot_data <- df_matched2 %>%
+  filter(subclass %in% random_subclasses) %>%
+  mutate(
+    Group = factor(PE_transaction, labels = c("Control", "Treatment (PE)")),
+    subclass = as.factor(subclass)
+  )
+ggplot(plot_data, aes(x = Time_Category, y = productivity_proxy, color = Group)) +
+  geom_line(aes(group = interaction(sa_company_name, Group)), size = 1, alpha = 0.9) +
+  geom_point(size = 2.2) +
+  facet_wrap(~ subclass, scales = "free_y", ncol = 2, switch = "both") +
+  scale_color_manual(
+    values = c("Control" = "#a29bfe", "Treatment (PE)" = "#6c5ce7"),
+    name = "Group"
+  ) +
+  labs(
+    title = "Parallel Productivity Trends for 4 Random Treatment Control Pairs ",
+    subtitle = "Each subclass contains one Treated and one Control firm",
+    x = "Years Relative to PE Transaction",
+    y = "Total Income"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    legend.position = "bottom",
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(size = 9),
+    panel.grid.major.x = element_blank(),
+    panel.border = element_rect(color = "grey80", fill = NA, size = 0.6),  # Add border around each facet
+    strip.background = element_rect(fill = "grey95", color = NA)
+  )
+
+
+
+
+```
